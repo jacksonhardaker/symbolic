@@ -118,7 +118,7 @@ use watto::Pod;
 
 pub use error::{Error, ErrorKind};
 pub use lookup::*;
-pub use writer::SymCacheConverter;
+pub use writer::{SymCacheConverter, SymCacheConverterOptions};
 
 use crate::v7::{SymCacheV7, SymCacheV8};
 use crate::v9::SymCacheV9;

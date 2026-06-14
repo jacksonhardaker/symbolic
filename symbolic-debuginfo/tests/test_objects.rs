@@ -562,6 +562,86 @@ fn test_mach_functions() -> Result<(), Error> {
 }
 
 #[test]
+fn test_line_records_use_relative_addresses_and_resolved_paths() -> Result<(), Error> {
+    for fixture_name in [
+        "linux/crash.debug",
+        "macos/crash.dSYM/Contents/Resources/DWARF/crash",
+    ] {
+        let view = ByteView::open(fixture(fixture_name))?;
+        let object = Object::parse(&view)?;
+
+        let session = object.debug_session()?;
+        let function = session
+            .functions()
+            .filter_map(|function| function.ok())
+            .find(|function| {
+                !function.compilation_dir.is_empty()
+                    && function
+                        .lines
+                        .first()
+                        .is_some_and(|line| !line.file.path_str().starts_with('/'))
+            })
+            .expect("expected at least one function with line records");
+        let expected_line = function.lines.first().expect("function had lines");
+
+        for query_size in [0, 1] {
+            let line_records = session.line_records(expected_line.address, query_size)?;
+
+            assert!(
+                !line_records.is_empty(),
+                "expected relative lookup to resolve a line"
+            );
+            assert_eq!(line_records[0].address, expected_line.address);
+            assert_eq!(line_records[0].line, expected_line.line);
+            let expected_file =
+                FileEntry::new(function.compilation_dir.into(), expected_line.file.clone());
+            assert_eq!(
+                line_records[0].file.path_str(),
+                expected_file.abs_path_str()
+            );
+            assert_eq!(line_records[0].size, Some(1));
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_mach_line_records_cover_multiple_sequences() -> Result<(), Error> {
+    let view = ByteView::open(fixture("macos/crash.dSYM/Contents/Resources/DWARF/crash"))?;
+    let object = Object::parse(&view)?;
+    let session = object.debug_session()?;
+    let functions = session.functions().collect::<Result<Vec<_>, _>>()?;
+    let start = functions
+        .iter()
+        .map(|function| function.address)
+        .min()
+        .unwrap();
+    let end = functions.iter().map(Function::end_address).max().unwrap();
+    let line_records = session.line_records(start, end - start)?;
+
+    for function in &functions {
+        let Some(line) = function.lines.first() else {
+            continue;
+        };
+        for expected in session.line_records(line.address, 1)? {
+            assert!(
+                line_records.iter().any(|record| {
+                    record.address <= expected.address
+                        && record.address + record.size.unwrap_or(0) > expected.address
+                        && record.line == expected.line
+                        && record.file == expected.file
+                }),
+                "wide lookup missed line record at {:#x}",
+                expected.address
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
 fn test_pe_32() -> Result<(), Error> {
     let view = ByteView::open(fixture("windows/crash.exe"))?;
     let object = Object::parse(&view)?;

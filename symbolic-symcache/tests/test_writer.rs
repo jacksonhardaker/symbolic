@@ -1,11 +1,269 @@
 use std::io::Cursor;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::{borrow::Cow, convert::Infallible};
 
-use symbolic_common::ByteView;
-use symbolic_debuginfo::Object;
-use symbolic_symcache::{FunctionsDebug, SymCache, SymCacheConverter};
+use symbolic_common::{Arch, ByteView, CodeId, DebugId, Name};
+use symbolic_debuginfo::{
+    sourcebundle::SourceFileDescriptor, DebugSession, FileEntry, FileFormat, Function, LineInfo,
+    Object, ObjectDebugSession, ObjectError, ObjectKind, ObjectLike, Symbol, SymbolMap,
+};
+use symbolic_symcache::{FunctionsDebug, SymCache, SymCacheConverter, SymCacheConverterOptions};
 use symbolic_testutils::fixture;
 
 type Error = Box<dyn std::error::Error>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MockDebugSession;
+
+impl<'session> DebugSession<'session> for MockDebugSession {
+    type Error = Infallible;
+    type FunctionIterator = std::iter::Empty<Result<Function<'session>, Self::Error>>;
+    type FileIterator = std::iter::Empty<Result<FileEntry<'session>, Self::Error>>;
+
+    fn functions(&'session self) -> Self::FunctionIterator {
+        std::iter::empty()
+    }
+
+    fn files(&'session self) -> Self::FileIterator {
+        std::iter::empty()
+    }
+
+    fn source_by_path(&self, _path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn line_records(
+        &'session self,
+        address: u64,
+        size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        let query_end = address.saturating_add(size.max(1));
+
+        Ok(vec![
+            LineInfo {
+                address,
+                size: Some(0x10),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 405,
+            },
+            LineInfo {
+                address: address + 0x10,
+                size: Some(query_end.saturating_sub(address + 0x10)),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 407,
+            },
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MockObject {
+    symbols: Vec<Symbol<'static>>,
+}
+
+impl MockObject {
+    fn new(symbols: Vec<Symbol<'static>>) -> Self {
+        Self { symbols }
+    }
+}
+
+struct CountingDebugSession<'data> {
+    functions: Vec<Function<'static>>,
+    line_record_calls: Arc<AtomicUsize>,
+    line_records: Vec<LineInfo<'static>>,
+    real_session: Option<ObjectDebugSession<'data>>,
+}
+
+impl<'session> DebugSession<'session> for CountingDebugSession<'_> {
+    type Error = ObjectError;
+    type FunctionIterator = std::vec::IntoIter<Result<Function<'session>, Self::Error>>;
+    type FileIterator = std::iter::Empty<Result<FileEntry<'session>, Self::Error>>;
+
+    fn functions(&'session self) -> Self::FunctionIterator {
+        self.functions
+            .clone()
+            .into_iter()
+            .map(Ok)
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn files(&'session self) -> Self::FileIterator {
+        std::iter::empty()
+    }
+
+    fn source_by_path(&self, _path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error> {
+        Ok(None)
+    }
+
+    fn line_records(
+        &'session self,
+        address: u64,
+        size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        self.line_record_calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(session) = &self.real_session {
+            return session.line_records(address, size);
+        }
+        Ok(self.line_records.clone())
+    }
+}
+
+#[derive(Debug)]
+struct FunctionBackedMockObject<'data, 'object> {
+    symbols: Vec<Symbol<'static>>,
+    functions: Vec<Function<'static>>,
+    line_record_calls: Arc<AtomicUsize>,
+    line_records: Vec<LineInfo<'static>>,
+    real_object: Option<&'object Object<'data>>,
+}
+
+impl FunctionBackedMockObject<'_, '_> {
+    fn new(
+        symbols: Vec<Symbol<'static>>,
+        functions: Vec<Function<'static>>,
+        line_record_calls: Arc<AtomicUsize>,
+        line_records: Vec<LineInfo<'static>>,
+    ) -> Self {
+        Self {
+            symbols,
+            functions,
+            line_record_calls,
+            line_records,
+            real_object: None,
+        }
+    }
+}
+
+impl<'object> ObjectLike<'static, 'object> for MockObject {
+    type Error = Infallible;
+    type Session = MockDebugSession;
+    type SymbolIterator = std::vec::IntoIter<Symbol<'static>>;
+
+    fn file_format(&self) -> FileFormat {
+        FileFormat::MachO
+    }
+
+    fn code_id(&self) -> Option<CodeId> {
+        None
+    }
+
+    fn debug_id(&self) -> DebugId {
+        DebugId::default()
+    }
+
+    fn arch(&self) -> Arch {
+        Arch::Arm64
+    }
+
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Debug
+    }
+
+    fn load_address(&self) -> u64 {
+        0
+    }
+
+    fn has_symbols(&self) -> bool {
+        true
+    }
+
+    fn symbols(&'object self) -> Self::SymbolIterator {
+        self.symbols.clone().into_iter()
+    }
+
+    fn symbol_map(&self) -> SymbolMap<'static> {
+        self.symbols.clone().into_iter().collect()
+    }
+
+    fn has_debug_info(&self) -> bool {
+        true
+    }
+
+    fn debug_session(&'object self) -> Result<Self::Session, Self::Error> {
+        Ok(MockDebugSession)
+    }
+
+    fn has_unwind_info(&self) -> bool {
+        false
+    }
+
+    fn has_sources(&self) -> bool {
+        false
+    }
+
+    fn is_malformed(&self) -> bool {
+        false
+    }
+}
+
+impl<'data, 'object> ObjectLike<'static, 'object> for FunctionBackedMockObject<'data, '_> {
+    type Error = ObjectError;
+    type Session = CountingDebugSession<'data>;
+    type SymbolIterator = std::vec::IntoIter<Symbol<'static>>;
+
+    fn file_format(&self) -> FileFormat {
+        FileFormat::MachO
+    }
+
+    fn code_id(&self) -> Option<CodeId> {
+        None
+    }
+
+    fn debug_id(&self) -> DebugId {
+        DebugId::default()
+    }
+
+    fn arch(&self) -> Arch {
+        Arch::Arm64
+    }
+
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Debug
+    }
+
+    fn load_address(&self) -> u64 {
+        0
+    }
+
+    fn has_symbols(&self) -> bool {
+        true
+    }
+
+    fn symbols(&'object self) -> Self::SymbolIterator {
+        self.symbols.clone().into_iter()
+    }
+
+    fn symbol_map(&self) -> SymbolMap<'static> {
+        self.symbols.clone().into_iter().collect()
+    }
+
+    fn has_debug_info(&self) -> bool {
+        true
+    }
+
+    fn debug_session(&'object self) -> Result<Self::Session, Self::Error> {
+        Ok(CountingDebugSession {
+            functions: self.functions.clone(),
+            line_record_calls: self.line_record_calls.clone(),
+            line_records: self.line_records.clone(),
+            real_session: self.real_object.map(Object::debug_session).transpose()?,
+        })
+    }
+
+    fn has_unwind_info(&self) -> bool {
+        false
+    }
+
+    fn has_sources(&self) -> bool {
+        false
+    }
+
+    fn is_malformed(&self) -> bool {
+        false
+    }
+}
 
 #[test]
 fn test_write_header_linux() -> Result<(), Error> {
@@ -35,7 +293,7 @@ fn test_write_header_linux() -> Result<(), Error> {
         functions: 697,
         source_locations: 8431,
         ranges: 6975,
-        string_bytes: 49877,
+        string_bytes: 48841,
     }
     "#);
 
@@ -160,6 +418,547 @@ fn test_lookup_no_lines() -> Result<(), Error> {
         protocol/http/HttpChannelChild.cpp:411:7',void>::_Do_call()"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_symbol_fallback_recovers_line_records() -> Result<(), Error> {
+    let object = MockObject::new(vec![Symbol {
+        name: Some(Cow::Borrowed("swift closure")),
+        address: 0x2061c,
+        size: 0x18,
+    }]);
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].line(), 407);
+    assert_eq!(
+        symbols[0].file().map(|file| file.full_path()),
+        Some("CrashCatalog.swift".to_string())
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_symbol_line_recovery_is_skipped_when_functions_exist() -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let mut object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x2061c,
+            size: 0x18,
+            name: Name::from("closure #1 in DispatchQueueCrash.trigger"),
+            compilation_dir: b"",
+            lines: vec![LineInfo {
+                address: 0x2061c,
+                size: Some(0x18),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 407,
+            }],
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        vec![LineInfo {
+            address: 0x2061c,
+            size: Some(0x18),
+            file: symbolic_debuginfo::FileInfo::from_filename(b"Ignored.swift"),
+            line: 999,
+        }],
+    );
+
+    for (address, size) in [(0x2061c, 0x18), (0x20618, 0x1c), (0x2061c, 0x20)] {
+        object.symbols[0].address = address;
+        object.symbols[0].size = size;
+
+        let mut buffer = Vec::new();
+        let mut converter = SymCacheConverter::new();
+        converter.process_object(&object)?;
+        converter.serialize(&mut Cursor::new(&mut buffer))?;
+        let symcache = SymCache::parse(&buffer)?;
+
+        let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].line(), 407);
+        assert_eq!(
+            symbols[0].function().name(),
+            "closure #1 in DispatchQueueCrash.trigger"
+        );
+        assert_eq!(line_record_calls.load(Ordering::Relaxed), 0);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_empty_function_line_recovery_can_be_disabled() -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x2061c,
+            size: 0x18,
+            name: Name::from("closure #1 in DispatchQueueCrash.trigger"),
+            compilation_dir: b"",
+            lines: Vec::new(),
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        vec![LineInfo {
+            address: 0x2061c,
+            size: Some(0x18),
+            file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+            line: 407,
+        }],
+    );
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::with_options(SymCacheConverterOptions {
+        enable_empty_function_line_recovery: false,
+        enable_symbol_line_recovery: true,
+    });
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(
+        symbols[0].function().name(),
+        "closure #1 in DispatchQueueCrash.trigger"
+    );
+    assert_eq!(symbols[0].line(), 0);
+    assert!(symbols[0].file().is_none());
+    assert_eq!(line_record_calls.load(Ordering::Relaxed), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_symbol_line_recovery_runs_for_uncovered_symbol_when_functions_exist() -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x1000,
+            size: 0x40,
+            name: Name::from("some other function"),
+            compilation_dir: b"",
+            lines: vec![LineInfo {
+                address: 0x1000,
+                size: Some(0x40),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"Other.swift"),
+                line: 12,
+            }],
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        vec![
+            LineInfo {
+                address: 0x2061c,
+                size: Some(0x10),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 405,
+            },
+            LineInfo {
+                address: 0x2062c,
+                size: Some(0x8),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 407,
+            },
+        ],
+    );
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].line(), 407);
+    assert_eq!(
+        symbols[0].file().map(|file| file.full_path()),
+        Some("CrashCatalog.swift".to_string())
+    );
+    assert_eq!(line_record_calls.load(Ordering::Relaxed), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_symbol_line_recovery_can_be_disabled() -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x1000,
+            size: 0x40,
+            name: Name::from("some other function"),
+            compilation_dir: b"",
+            lines: vec![LineInfo {
+                address: 0x1000,
+                size: Some(0x40),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"Other.swift"),
+                line: 12,
+            }],
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        vec![
+            LineInfo {
+                address: 0x2061c,
+                size: Some(0x10),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 405,
+            },
+            LineInfo {
+                address: 0x2062c,
+                size: Some(0x8),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 407,
+            },
+        ],
+    );
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::with_options(SymCacheConverterOptions {
+        enable_empty_function_line_recovery: true,
+        enable_symbol_line_recovery: false,
+    });
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].function().name(), "swift closure");
+    assert_eq!(symbols[0].line(), 0);
+    assert!(symbols[0].file().is_none());
+    assert_eq!(line_record_calls.load(Ordering::Relaxed), 0);
+
+    Ok(())
+}
+
+#[test]
+fn test_symbol_line_recovery_keeps_symbol_only_mapping_when_session_returns_no_lines(
+) -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x1000,
+            size: 0x40,
+            name: Name::from("some other function"),
+            compilation_dir: b"",
+            lines: vec![LineInfo {
+                address: 0x1000,
+                size: Some(0x40),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"Other.swift"),
+                line: 12,
+            }],
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        Vec::new(),
+    );
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].function().name(), "swift closure");
+    assert_eq!(symbols[0].line(), 0);
+    assert!(symbols[0].file().is_none());
+    assert_eq!(line_record_calls.load(Ordering::Relaxed), 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_symbol_line_recovery_overwrites_existing_unknown_source_mapping() -> Result<(), Error> {
+    let line_record_calls = Arc::new(AtomicUsize::new(0));
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some(Cow::Borrowed("swift closure")),
+            address: 0x2061c,
+            size: 0x18,
+        }],
+        vec![Function {
+            address: 0x2061c,
+            size: 0x18,
+            name: Name::from("closure #1 in DispatchQueueCrash.trigger"),
+            compilation_dir: b"",
+            lines: Vec::new(),
+            inlinees: Vec::new(),
+            inline: false,
+        }],
+        line_record_calls.clone(),
+        vec![
+            LineInfo {
+                address: 0x2061c,
+                size: Some(0x10),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 405,
+            },
+            LineInfo {
+                address: 0x2062c,
+                size: Some(0x8),
+                file: symbolic_debuginfo::FileInfo::from_filename(b"CrashCatalog.swift"),
+                line: 407,
+            },
+        ],
+    );
+
+    let mut buffer = Vec::new();
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(&object)?;
+    converter.serialize(&mut Cursor::new(&mut buffer))?;
+    let symcache = SymCache::parse(&buffer)?;
+
+    let symbols = symcache.lookup(0x20630).collect::<Vec<_>>();
+
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].line(), 407);
+    assert_eq!(
+        symbols[0].file().map(|file| file.full_path()),
+        Some("CrashCatalog.swift".to_string())
+    );
+    assert!(line_record_calls.load(Ordering::Relaxed) >= 1);
+
+    Ok(())
+}
+
+#[test]
+fn test_recovered_lines_preserve_gaps() -> Result<(), Error> {
+    for recover_function in [false, true] {
+        let function = Function {
+            address: 0x1000,
+            size: 0x30,
+            name: Name::from("recovered function"),
+            compilation_dir: b"",
+            lines: Vec::new(),
+            inlinees: Vec::new(),
+            inline: false,
+        };
+        let object = FunctionBackedMockObject::new(
+            vec![Symbol {
+                name: Some("recovered function".into()),
+                address: 0x1000,
+                size: 0x30,
+            }],
+            if recover_function {
+                vec![function]
+            } else {
+                Vec::new()
+            },
+            Arc::new(AtomicUsize::new(0)),
+            vec![
+                LineInfo {
+                    address: 0x1004,
+                    size: Some(0xc),
+                    file: symbolic_debuginfo::FileInfo::from_filename(b"Crash.swift"),
+                    line: 10,
+                },
+                LineInfo {
+                    address: 0x1020,
+                    size: Some(4),
+                    file: symbolic_debuginfo::FileInfo::from_filename(b"Crash.swift"),
+                    line: 20,
+                },
+            ],
+        );
+        let mut converter = SymCacheConverter::new();
+        converter.process_object(&object)?;
+        let mut buffer = Vec::new();
+        converter.serialize(&mut buffer)?;
+        let cache = SymCache::parse(&buffer)?;
+
+        for (address, expected_line) in [
+            (0x1000, 0),
+            (0x1003, 0),
+            (0x1004, 10),
+            (0x100f, 10),
+            (0x1010, 0),
+            (0x101f, 0),
+            (0x1020, 20),
+            (0x1023, 20),
+            (0x1024, 0),
+            (0x102f, 0),
+        ] {
+            let locations = cache.lookup(address).collect::<Vec<_>>();
+            assert_eq!(locations.len(), 1);
+            assert_eq!(locations[0].function().name(), "recovered function");
+            assert_eq!(
+                locations[0].line(),
+                expected_line,
+                "address {address:#x}, function recovery {recover_function}"
+            );
+            assert_eq!(locations[0].file().is_none(), expected_line == 0);
+        }
+        assert!(cache.lookup(0x1030).next().is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_zero_sized_symbol_limits_recovered_source() -> Result<(), Error> {
+    let object = FunctionBackedMockObject::new(
+        vec![Symbol {
+            name: Some("last symbol".into()),
+            address: 0x1000,
+            size: 0,
+        }],
+        Vec::new(),
+        Arc::new(AtomicUsize::new(0)),
+        vec![LineInfo {
+            address: 0x1000,
+            size: Some(1),
+            file: symbolic_debuginfo::FileInfo::from_filename(b"Crash.swift"),
+            line: 7,
+        }],
+    );
+    let mut converter = SymCacheConverter::new();
+    converter.process_object(&object)?;
+    let mut buffer = Vec::new();
+    converter.serialize(&mut buffer)?;
+    let cache = SymCache::parse(&buffer)?;
+    assert_eq!(cache.lookup(0x1000).next().unwrap().line(), 7);
+    for address in [0x1001, 0x2000] {
+        let location = cache.lookup(address).next().unwrap();
+        assert_eq!(location.function().name(), "last symbol");
+        assert_eq!(location.line(), 0);
+        assert!(location.file().is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn test_optimized_swift_closure_recovery() -> Result<(), Error> {
+    let view = ByteView::open(fixture("macos/optimized-closure/optimized-closure.debug"))?;
+    let object = Object::parse(&view)?;
+    let symbols = object.symbol_map();
+    let closure = symbols
+        .iter()
+        .find(|symbol| symbol.name().is_some_and(|name| name.contains("cfU_TA")))
+        .expect("optimized closure symbol");
+    let session = object.debug_session()?;
+    let function = session
+        .functions()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|function| function.address == closure.address)
+        .expect("closure function");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut recovery_object = FunctionBackedMockObject::new(
+        symbols
+            .iter()
+            .map(|symbol| Symbol {
+                name: symbol.name().map(|name| Cow::Owned(name.to_owned())),
+                address: symbol.address,
+                size: symbol.size,
+            })
+            .collect(),
+        Vec::new(),
+        calls.clone(),
+        Vec::new(),
+    );
+    recovery_object.real_object = Some(&object);
+
+    for mode in ["ordinary", "empty-function", "symbol-only"] {
+        recovery_object.functions = if mode == "empty-function" {
+            vec![Function {
+                address: function.address,
+                size: function.size,
+                name: Name::from(function.name.as_str().to_owned()),
+                compilation_dir: b"",
+                lines: Vec::new(),
+                inlinees: Vec::new(),
+                inline: false,
+            }]
+        } else {
+            Vec::new()
+        };
+        for enabled in [false, true] {
+            calls.store(0, Ordering::Relaxed);
+            let mut converter = SymCacheConverter::with_options(SymCacheConverterOptions {
+                enable_empty_function_line_recovery: enabled,
+                enable_symbol_line_recovery: enabled,
+            });
+            if mode == "ordinary" {
+                converter.process_object(&object)?;
+            } else {
+                converter.process_object(&recovery_object)?;
+                assert_eq!(calls.load(Ordering::Relaxed) > 0, enabled);
+            }
+            let mut buffer = Vec::new();
+            converter.serialize(&mut buffer)?;
+            let cache = SymCache::parse(&buffer)?;
+            for (offset, line) in [(4, 3), (7, 3), (8, 4), (11, 4)] {
+                let locations = cache.lookup(closure.address + offset).collect::<Vec<_>>();
+                assert!(!locations.is_empty(), "{mode}, recovery={enabled}");
+                if enabled || mode == "ordinary" {
+                    assert_eq!(locations[0].line(), line, "{mode}");
+                    assert_eq!(
+                        locations[0].file().unwrap().full_path(),
+                        "/symbolic/fixtures/optimized-closure/OptimizedClosure.swift",
+                        "{mode}"
+                    );
+                } else {
+                    assert_eq!(locations[0].line(), 0, "{mode}");
+                    assert!(locations[0].file().is_none(), "{mode}");
+                }
+                assert!(
+                    locations
+                        .iter()
+                        .any(|location| location.function().name() == closure.name().unwrap()),
+                    "{mode}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

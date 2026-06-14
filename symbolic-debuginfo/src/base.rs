@@ -811,6 +811,26 @@ pub trait DebugSession<'session> {
     /// Returns a descriptor that has all the information available of the source.  It can
     /// either contain the source contents directly, if it was embedded, or a source link.
     fn source_by_path(&self, path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error>;
+
+    /// Returns source line records whose address ranges overlap the requested range.
+    ///
+    /// A zero size requests the single byte at `address`. File paths should be resolved against
+    /// their owning compilation directory, since callers may not have a corresponding function.
+    ///
+    /// Implementations should return the results in ascending address order and clip them to the
+    /// requested range when necessary. Callers use this both for ordinary line resolution and for
+    /// recovery from optimized debug-info shapes where a function or public symbol exists but does
+    /// not carry its own pre-attached line rows. Implementations are therefore encouraged to do a
+    /// cheap internal overlap test first and return an empty vector quickly for negative lookups
+    /// before paying the cost of materializing line rows, resolving files, and deduplicating
+    /// results.
+    fn line_records(
+        &'session self,
+        _address: u64,
+        _size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        Ok(Vec::new())
+    }
 }
 
 /// An object containing debug information.

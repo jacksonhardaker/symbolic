@@ -15,6 +15,9 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::ops::Range as StdRange;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use fallible_iterator::FallibleIterator;
@@ -242,11 +245,16 @@ struct DwarfSequence {
 #[derive(Debug)]
 struct DwarfLineProgram<'d> {
     header: LineNumberProgramHeader<'d>,
+    // Each sequence stores the decoded rows for that contiguous line-program region so repeated
+    // address queries do not need to rerun gimli's state machine over the raw DWARF program.
     sequences: Vec<DwarfSequence>,
 }
 
 impl<'d> DwarfLineProgram<'d> {
     fn prepare(program: IncompleteLineNumberProgram<'d>) -> Self {
+        // This eagerly decodes the unit's line program once per debug session. That is more work
+        // up front than a purely lazy row walk, but it amortizes well for symcache conversion,
+        // which may query many distinct address ranges against the same session.
         let mut sequences = Vec::new();
         let mut sequence_rows = Vec::<DwarfRow>::new();
         let mut prev_address = 0;
@@ -356,6 +364,9 @@ impl<'d> DwarfLineProgram<'d> {
     /// Range `A` and `B` yield rows 2 and 3, range `C` yields all rows of the sequence,
     /// `1`, `2`, and `3`.
     pub fn get_rows(&self, range: &Range) -> &[DwarfRow] {
+        // The prepared rows and per-sequence bounds are already cached on the session. What still
+        // happens per query is selecting the first overlapping sequence and binary-searching the
+        // rows inside that sequence.
         for seq in &self.sequences {
             if range.begin >= seq.end || seq.start >= range.end {
                 continue;
@@ -558,7 +569,7 @@ struct DwarfUnit<'d, 'a> {
     inner: UnitRef<'d, 'a>,
     bcsymbolmap: Option<&'d BcSymbolMap<'d>>,
     language: Language,
-    line_program: Option<DwarfLineProgram<'d>>,
+    line_program: Option<&'a DwarfLineProgram<'d>>,
     prefer_dwarf_names: bool,
 }
 
@@ -592,10 +603,7 @@ impl<'d, 'a> DwarfUnit<'d, 'a> {
             _ => Language::Unknown,
         };
 
-        let line_program = unit
-            .line_program
-            .as_ref()
-            .map(|program| DwarfLineProgram::prepare(program.clone()));
+        let line_program = info.get_line_program(unit);
 
         // The value of DW_AT_producer may be an in-place string or a
         // reference into the debug_str section. We use `string_value`
@@ -782,10 +790,7 @@ impl<'d, 'a> DwarfUnit<'d, 'a> {
 
     /// Resolves a file entry by its index.
     fn resolve_file(&self, file_id: u64) -> Option<FileInfo<'d>> {
-        let line_program = match self.line_program {
-            Some(ref program) => &program.header,
-            None => return None,
-        };
+        let line_program = &self.line_program?.header;
 
         line_program
             .file(file_id)
@@ -1232,13 +1237,60 @@ impl<'data> DwarfSections<'data> {
     }
 }
 
+#[derive(Debug)]
+struct LineRecordRange {
+    range: StdRange<u64>,
+    unit_index: usize,
+    sequence_index: usize,
+}
+
+#[derive(Debug)]
+struct LineRecordIndex {
+    ranges: Vec<LineRecordRange>,
+    prefix_max_ends: Vec<u64>,
+}
+
+impl LineRecordIndex {
+    fn new(mut ranges: Vec<LineRecordRange>) -> Self {
+        ranges.sort_unstable_by_key(|entry| entry.range.start);
+        let mut max_end = 0;
+        let prefix_max_ends = ranges
+            .iter()
+            .map(|entry| {
+                max_end = max_end.max(entry.range.end);
+                max_end
+            })
+            .collect();
+        Self {
+            ranges,
+            prefix_max_ends,
+        }
+    }
+
+    fn overlapping(&self, begin: u64, end: u64) -> impl Iterator<Item = &LineRecordRange> {
+        let last = if begin < end {
+            self.ranges.partition_point(|entry| entry.range.start < end)
+        } else {
+            0
+        };
+        let first = self.prefix_max_ends[..last].partition_point(|&max_end| max_end <= begin);
+        self.ranges[first..last]
+            .iter()
+            .filter(move |entry| entry.range.end > begin)
+    }
+}
+
 struct DwarfInfo<'data> {
     inner: DwarfInner<'data>,
     headers: Vec<UnitHeader<'data>>,
     units: Vec<OnceCell<Option<Unit<'data>>>>,
+    line_programs: Vec<OnceCell<Option<DwarfLineProgram<'data>>>>,
     symbol_map: SymbolMap<'data>,
     address_offset: i64,
     kind: ObjectKind,
+    line_record_ranges: OnceCell<LineRecordIndex>,
+    #[cfg(test)]
+    line_program_preparations: AtomicUsize,
 }
 
 impl<'d> Deref for DwarfInfo<'d> {
@@ -1284,14 +1336,64 @@ impl<'d> DwarfInfo<'d> {
         // Prepare random access to unit headers.
         let headers = FallibleIterator::collect::<Vec<_>>(inner.units())?;
         let units = headers.iter().map(|_| OnceCell::new()).collect();
+        let line_programs = headers.iter().map(|_| OnceCell::new()).collect();
 
         Ok(DwarfInfo {
             inner,
             headers,
             units,
+            line_programs,
             symbol_map,
             address_offset,
             kind,
+            line_record_ranges: OnceCell::new(),
+            #[cfg(test)]
+            line_program_preparations: AtomicUsize::new(0),
+        })
+    }
+
+    fn get_line_program(&self, unit: &Unit<'d>) -> Option<&DwarfLineProgram<'d>> {
+        let index = self
+            .headers
+            .binary_search_by_key(&unit.header.offset(), UnitHeader::offset)
+            .ok()?;
+        self.line_programs[index]
+            .get_or_init(|| {
+                unit.line_program.as_ref().map(|program| {
+                    #[cfg(test)]
+                    self.line_program_preparations
+                        .fetch_add(1, Ordering::Relaxed);
+                    DwarfLineProgram::prepare(program.clone())
+                })
+            })
+            .as_ref()
+    }
+
+    fn line_record_ranges(&self) -> Result<&LineRecordIndex, DwarfError> {
+        self.line_record_ranges.get_or_try_init(|| {
+            let mut ranges = Vec::new();
+
+            for index in 0..self.headers.len() {
+                let Some(unit) = self.get_unit(index)? else {
+                    continue;
+                };
+                let Some(unit) = DwarfUnit::from_unit(unit, self, None)? else {
+                    continue;
+                };
+                let Some(line_program) = unit.line_program.as_ref() else {
+                    continue;
+                };
+
+                for (sequence_index, sequence) in line_program.sequences.iter().enumerate() {
+                    ranges.push(LineRecordRange {
+                        range: sequence.start..sequence.end,
+                        unit_index: index,
+                        sequence_index,
+                    });
+                }
+            }
+
+            Ok(LineRecordIndex::new(ranges))
         })
     }
 
@@ -1469,6 +1571,84 @@ impl<'data> DwarfDebugSession<'data> {
     ) -> Result<Option<SourceFileDescriptor<'_>>, DwarfError> {
         Ok(None)
     }
+
+    /// Returns line records whose ranges overlap the requested address span.
+    pub fn line_records(&self, address: u64, size: u64) -> Result<Vec<LineInfo<'_>>, DwarfError> {
+        let address_offset = self.cell.get().address_offset;
+        let query = Range {
+            begin: offset(address, -address_offset),
+            end: offset(address.saturating_add(size.max(1)), -address_offset),
+        };
+
+        let mut line_records = Vec::new();
+
+        for entry in self
+            .cell
+            .get()
+            .line_record_ranges()?
+            .overlapping(query.begin, query.end)
+        {
+            let Some(unit) = self.cell.get().get_unit(entry.unit_index)? else {
+                continue;
+            };
+            let Some(unit) =
+                DwarfUnit::from_unit(unit, self.cell.get(), self.bcsymbolmap.as_deref())?
+            else {
+                continue;
+            };
+            let Some(line_program) = unit.line_program.as_ref() else {
+                continue;
+            };
+
+            let sequence = &line_program.sequences[entry.sequence_index];
+            let start = sequence
+                .rows
+                .partition_point(|row| row.address <= query.begin)
+                .saturating_sub(1);
+
+            for row in sequence.rows[start..]
+                .iter()
+                .take_while(|row| row.address < query.end)
+            {
+                let row_end = row
+                    .size
+                    .map_or(sequence.end, |size| row.address.saturating_add(size))
+                    .min(query.end)
+                    .min(sequence.end);
+                let row_start = row.address.max(query.begin);
+
+                if row_end <= row_start {
+                    continue;
+                }
+
+                line_records.push(LineInfo {
+                    address: offset(row_start, address_offset),
+                    size: Some(row_end - row_start),
+                    file: unit
+                        .resolve_file(row.file_index)
+                        .map(|file| {
+                            FileInfo::from_path_owned(
+                                FileEntry::new(unit.compilation_dir().into(), file)
+                                    .abs_path_str()
+                                    .as_bytes(),
+                            )
+                        })
+                        .unwrap_or_default(),
+                    line: row.line.unwrap_or(0),
+                });
+            }
+        }
+
+        line_records.sort_by_key(|line| line.address);
+        line_records.dedup_by(|left, right| {
+            left.address == right.address
+                && left.size == right.size
+                && left.line == right.line
+                && left.file == right.file
+        });
+
+        Ok(line_records)
+    }
 }
 
 impl<'session> DebugSession<'session> for DwarfDebugSession<'_> {
@@ -1486,6 +1666,14 @@ impl<'session> DebugSession<'session> for DwarfDebugSession<'_> {
 
     fn source_by_path(&self, path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error> {
         self.source_by_path(path)
+    }
+
+    fn line_records(
+        &'session self,
+        address: u64,
+        size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        self.line_records(address, size)
     }
 }
 
@@ -1607,7 +1795,93 @@ impl std::iter::FusedIterator for DwarfFunctionIterator<'_> {}
 mod tests {
     use super::*;
 
+    use symbolic_common::ByteView;
+    use symbolic_testutils::fixture;
+
     use crate::macho::MachObject;
+
+    #[cfg(feature = "macho")]
+    #[test]
+    fn test_line_programs_are_prepared_once() {
+        let view =
+            ByteView::open(fixture("macos/crash.dSYM/Contents/Resources/DWARF/crash")).unwrap();
+        let object = MachObject::parse(&view).unwrap();
+        let session = object.debug_session().unwrap();
+        let functions = session.functions().collect::<Result<Vec<_>, _>>().unwrap();
+        let initial = session
+            .cell
+            .get()
+            .line_program_preparations
+            .load(Ordering::Relaxed);
+        assert!(initial > 0);
+        let cold_session = object.debug_session().unwrap();
+        for cached_session in [&session, &cold_session] {
+            for _repeat in 0..4 {
+                for line in functions
+                    .iter()
+                    .filter_map(|function| function.lines.first())
+                    .take(16)
+                {
+                    assert!(!cached_session
+                        .line_records(line.address, 1)
+                        .unwrap()
+                        .is_empty());
+                }
+                assert!(cached_session
+                    .line_records(0xffff_ff00, 1)
+                    .unwrap()
+                    .is_empty());
+            }
+            cached_session
+                .functions()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            cached_session
+                .files()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                cached_session
+                    .cell
+                    .get()
+                    .line_program_preparations
+                    .load(Ordering::Relaxed),
+                initial
+            );
+        }
+    }
+
+    #[test]
+    fn test_line_record_index_overlaps() {
+        let index = LineRecordIndex::new(vec![
+            LineRecordRange {
+                range: 10..100,
+                unit_index: 0,
+                sequence_index: 0,
+            },
+            LineRecordRange {
+                range: 20..30,
+                unit_index: 1,
+                sequence_index: 0,
+            },
+            LineRecordRange {
+                range: 110..120,
+                unit_index: 0,
+                sequence_index: 1,
+            },
+        ]);
+        let matches = |begin, end| {
+            index
+                .overlapping(begin, end)
+                .map(|entry| (entry.unit_index, entry.sequence_index))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(matches(25, 26), vec![(0, 0), (1, 0)]);
+        assert_eq!(matches(90, 115), vec![(0, 0), (0, 1)]);
+        assert!(matches(100, 110).is_empty());
+        assert!(matches(20, 20).is_empty());
+        assert!(matches(30, 20).is_empty());
+    }
 
     #[cfg(feature = "macho")]
     #[test]
