@@ -560,6 +560,32 @@ fn test_mach_functions() -> Result<(), Error> {
 }
 
 #[test]
+fn test_mach_line_records_use_relative_addresses() -> Result<(), Error> {
+    let view = ByteView::open(fixture("macos/crash.dSYM/Contents/Resources/DWARF/crash"))?;
+    let object = Object::parse(&view)?;
+
+    let session = object.debug_session()?;
+    let function = session
+        .functions()
+        .filter_map(|function| function.ok())
+        .find(|function| !function.lines.is_empty())
+        .expect("expected at least one function with line records");
+    let expected_line = function.lines.first().expect("function had lines");
+
+    let line_records = session.line_records(expected_line.address, 1)?;
+
+    assert!(
+        !line_records.is_empty(),
+        "expected relative lookup to resolve a line"
+    );
+    assert_eq!(line_records[0].address, expected_line.address);
+    assert_eq!(line_records[0].line, expected_line.line);
+    assert_eq!(line_records[0].file, expected_line.file);
+
+    Ok(())
+}
+
+#[test]
 fn test_pe_32() -> Result<(), Error> {
     let view = ByteView::open(fixture("windows/crash.exe"))?;
     let object = Object::parse(&view)?;

@@ -524,6 +524,27 @@ impl ObjectDebugSession<'_> {
             }
         }
     }
+
+    /// Returns line records whose ranges overlap the requested address span.
+    pub fn line_records(&self, address: u64, size: u64) -> Result<Vec<LineInfo<'_>>, ObjectError> {
+        match *self {
+            ObjectDebugSession::Breakpad(ref s) => s
+                .line_records(address, size)
+                .map_err(ObjectError::transparent),
+            ObjectDebugSession::Dwarf(ref s) => s
+                .line_records(address, size)
+                .map_err(ObjectError::transparent),
+            ObjectDebugSession::Pdb(ref s) => s
+                .line_records(address, size)
+                .map_err(ObjectError::transparent),
+            ObjectDebugSession::SourceBundle(ref s) => s
+                .line_records(address, size)
+                .map_err(ObjectError::transparent),
+            ObjectDebugSession::PortablePdb(ref s) => s
+                .line_records(address, size)
+                .map_err(ObjectError::transparent),
+        }
+    }
 }
 
 impl<'session> DebugSession<'session> for ObjectDebugSession<'_> {
@@ -541,6 +562,14 @@ impl<'session> DebugSession<'session> for ObjectDebugSession<'_> {
 
     fn source_by_path(&self, path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error> {
         self.source_by_path(path)
+    }
+
+    fn line_records(
+        &'session self,
+        address: u64,
+        size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        self.line_records(address, size)
     }
 }
 

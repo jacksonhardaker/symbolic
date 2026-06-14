@@ -3,15 +3,36 @@
 use std::collections::btree_map;
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::ops::Range;
 
 use indexmap::IndexSet;
 use symbolic_common::{Arch, DebugId};
-use symbolic_debuginfo::{DebugSession, FileFormat, Function, ObjectLike, Symbol};
+use symbolic_debuginfo::{DebugSession, FileFormat, Function, LineInfo, ObjectLike, Symbol};
 use watto::{Pod, StringTable, Writer};
 
 use crate::raw::v9::NO_SOURCE_LOCATION;
 use crate::{raw, transform};
 use crate::{Error, ErrorKind};
+
+/// Options controlling optional line-table recovery during SymCache conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SymCacheConverterOptions {
+    /// Recover line rows for top-level functions whose debug-session representation carries a
+    /// concrete address range but no attached line records.
+    pub enable_empty_function_line_recovery: bool,
+    /// Recover line rows from uncovered public symbols when no concrete function-derived source
+    /// mapping already covers the same address range.
+    pub enable_symbol_line_recovery: bool,
+}
+
+impl Default for SymCacheConverterOptions {
+    fn default() -> Self {
+        Self {
+            enable_empty_function_line_recovery: true,
+            enable_symbol_line_recovery: true,
+        }
+    }
+}
 
 /// The SymCache Converter.
 ///
@@ -30,6 +51,8 @@ pub struct SymCacheConverter<'a> {
 
     /// A list of transformers that are used to transform each function / source location.
     transformers: transform::Transformers<'a>,
+
+    options: SymCacheConverterOptions,
 
     string_table: StringTable,
     /// The set of all [`raw::v9::File`]s that have been added to this `Converter`.
@@ -55,7 +78,15 @@ pub struct SymCacheConverter<'a> {
 impl<'a> SymCacheConverter<'a> {
     /// Creates a new Converter.
     pub fn new() -> Self {
-        Self::default()
+        Self::with_options(Default::default())
+    }
+
+    /// Creates a new converter with explicit recovery options.
+    pub fn with_options(options: SymCacheConverterOptions) -> Self {
+        Self {
+            options,
+            ..Self::default()
+        }
     }
 
     /// Adds a new [`transform::Transformer`] to this [`SymCacheConverter`].
@@ -99,19 +130,131 @@ impl<'a> SymCacheConverter<'a> {
 
         self.is_windows_object = matches!(object.file_format(), FileFormat::Pe | FileFormat::Pdb);
 
+        // We keep track of top-level function coverage so symbol fallback only runs for address
+        // ranges that were genuinely left behind by the debug-session function walk. This lets us
+        // recover line info for optimized shapes without letting public symbols overwrite good
+        // function-derived mappings.
+        let mut function_ranges = Vec::new();
+
         for function in session.functions() {
-            let function = function.map_err(|e| Error::new(ErrorKind::BadDebugFile, e))?;
+            let mut function = function.map_err(|e| Error::new(ErrorKind::BadDebugFile, e))?;
+
+            // Some optimized DWARF shapes still produce a concrete top-level function entry but do
+            // not attach any line rows to it. Swift closures compiled under optimization were the
+            // motivating example: the function exists, but all source locations only live in the
+            // raw line table. Ask the session for rows anyway and let the session return quickly
+            // when the address range has no line-table coverage.
+            if self.options.enable_empty_function_line_recovery
+                && !function.inline
+                && function.lines.is_empty()
+            {
+                function.lines = session
+                    .line_records(function.address, function.size)
+                    .map_err(|e| Error::new(ErrorKind::BadDebugFile, e))?;
+            }
+
+            // Only top-level concrete functions participate in coverage gating. Inlinees are
+            // already represented under their parents and zero-sized functions do not describe a
+            // stable half-open range that can suppress symbol fallback.
+            if !function.inline && function.size > 0 {
+                function_ranges.push(function.address..function.end_address());
+            }
 
             self.process_symbolic_function(&function);
         }
 
-        for symbol in object.symbols() {
-            self.process_symbolic_symbol(&symbol);
+        function_ranges.sort_unstable_by_key(|range| range.start);
+        let function_ranges = merge_ranges(function_ranges);
+
+        // Public symbols are a fallback, not a primary source of truth. We only use them to seed
+        // symcache ranges that the function walk left uncovered.
+        let symbol_map = object.symbol_map();
+
+        for symbol in symbol_map.iter() {
+            // This branch recovers optimized shapes where a public symbol spans real code and the
+            // line table knows about that code, but the debug-session function tree did not expose
+            // usable lines for the same range. The real Swift closure case that motivated this
+            // patch lands here. The separate option lets callers keep empty-function recovery but
+            // still opt out of symbol fallback if public-symbol probes are too expensive for their
+            // workload.
+            let line_records = if self.options.enable_symbol_line_recovery
+                && !range_is_covered(&function_ranges, symbol.address, symbol.size)
+                && self.should_probe_symbol_line_records(symbol)
+            {
+                session
+                    .line_records(symbol.address, symbol.size)
+                    .map_err(|e| Error::new(ErrorKind::BadDebugFile, e))?
+            } else {
+                Vec::new()
+            };
+
+            self.process_symbolic_symbol_with_lines(symbol, &line_records);
         }
 
         self.is_windows_object = false;
 
         Ok(())
+    }
+
+    fn source_location_from_line(
+        &mut self,
+        line: &LineInfo<'_>,
+        function_idx: u32,
+        inlined_into_idx: u32,
+        comp_dir: Option<&str>,
+    ) -> raw::v9::SourceLocation {
+        let mut location = transform::SourceLocation {
+            file: transform::File {
+                name: line.file.name_str(),
+                directory: Some(line.file.dir_str()),
+                comp_dir: comp_dir.map(Into::into),
+                srcsrv_name: line.file.srcsrv_name_str(),
+                srcsrv_dir: line.file.srcsrv_dir_str(),
+                srcsrv_revision: line.file.srcsrv_revision().map(|s| s.into()),
+            },
+            line: line.line as u32,
+        };
+        for transformer in &mut self.transformers.0 {
+            location = transformer.transform_source_location(location);
+        }
+
+        let name_offset = self.string_table.insert(&location.file.name) as u32;
+        let directory_offset = location
+            .file
+            .directory
+            .map_or(u32::MAX, |d| self.string_table.insert(&d) as u32);
+        let comp_dir_offset = location
+            .file
+            .comp_dir
+            .map_or(u32::MAX, |cd| self.string_table.insert(&cd) as u32);
+        let srcsrv_name_offset = location
+            .file
+            .srcsrv_name
+            .map_or(u32::MAX, |r| self.string_table.insert(&r) as u32);
+        let srcsrv_dir_offset = location
+            .file
+            .srcsrv_dir
+            .map_or(u32::MAX, |r| self.string_table.insert(&r) as u32);
+        let srcsrv_revision_offset = location
+            .file
+            .srcsrv_revision
+            .map_or(u32::MAX, |r| self.string_table.insert(&r) as u32);
+
+        let (file_idx, _) = self.files.insert_full(raw::v9::File {
+            name_offset,
+            directory_offset,
+            comp_dir_offset,
+            srcsrv_name_offset,
+            srcsrv_dir_offset,
+            srcsrv_revision_offset,
+        });
+
+        raw::v9::SourceLocation {
+            file_idx: file_idx as u32,
+            line: location.line,
+            function_idx,
+            inlined_into_idx,
+        }
     }
 
     /// Processes an individual [`Function`], adding its line information to the converter.
@@ -223,58 +366,8 @@ impl<'a> SymCacheConverter<'a> {
             }
             let inlined_into_idx = current_call_location.1;
 
-            let mut location = transform::SourceLocation {
-                file: transform::File {
-                    name: line.file.name_str(),
-                    directory: Some(line.file.dir_str()),
-                    comp_dir: comp_dir.map(Into::into),
-                    srcsrv_name: line.file.srcsrv_name_str(),
-                    srcsrv_dir: line.file.srcsrv_dir_str(),
-                    srcsrv_revision: line.file.srcsrv_revision().map(|s| s.into()),
-                },
-                line: line.line as u32,
-            };
-            for transformer in &mut self.transformers.0 {
-                location = transformer.transform_source_location(location);
-            }
-
-            let name_offset = string_table.insert(&location.file.name) as u32;
-            let directory_offset = location
-                .file
-                .directory
-                .map_or(u32::MAX, |d| string_table.insert(&d) as u32);
-            let comp_dir_offset = location
-                .file
-                .comp_dir
-                .map_or(u32::MAX, |cd| string_table.insert(&cd) as u32);
-            let srcsrv_name_offset = location
-                .file
-                .srcsrv_name
-                .map_or(u32::MAX, |r| string_table.insert(&r) as u32);
-            let srcsrv_dir_offset = location
-                .file
-                .srcsrv_dir
-                .map_or(u32::MAX, |r| string_table.insert(&r) as u32);
-            let srcsrv_revision_offset = location
-                .file
-                .srcsrv_revision
-                .map_or(u32::MAX, |r| string_table.insert(&r) as u32);
-
-            let (file_idx, _) = self.files.insert_full(raw::v9::File {
-                name_offset,
-                directory_offset,
-                comp_dir_offset,
-                srcsrv_name_offset,
-                srcsrv_dir_offset,
-                srcsrv_revision_offset,
-            });
-
-            let source_location = raw::v9::SourceLocation {
-                file_idx: file_idx as u32,
-                line: location.line,
-                function_idx,
-                inlined_into_idx,
-            };
+            let source_location =
+                self.source_location_from_line(line, function_idx, inlined_into_idx, comp_dir);
 
             // The current line can be a "self line", or a "call line", or even a mixture.
             //
@@ -410,6 +503,14 @@ impl<'a> SymCacheConverter<'a> {
 
     /// Processes an individual [`Symbol`].
     pub fn process_symbolic_symbol(&mut self, symbol: &Symbol<'_>) {
+        self.process_symbolic_symbol_with_lines(symbol, &[]);
+    }
+
+    fn process_symbolic_symbol_with_lines(
+        &mut self,
+        symbol: &Symbol<'_>,
+        line_records: &[LineInfo<'_>],
+    ) {
         let name_idx = {
             let mut function = transform::Function {
                 name: match symbol.name {
@@ -431,24 +532,73 @@ impl<'a> SymCacheConverter<'a> {
             self.string_table.insert(function_name) as u32
         };
 
-        // Insert a source location for the symbol, overwriting `NO_SOURCE_LOCATION` sentinel
-        // values but not actual source locations coming from e.g. functions.
-        insert_source_location(&mut self.ranges, symbol.address as u32, || {
-            let function = raw::v9::Function {
-                name_offset: name_idx,
-                _comp_dir_offset: u32::MAX,
-                entry_pc: symbol.address as u32,
-                lang: u32::MAX,
-            };
-            let function_idx = self.functions.insert_full(function).0 as u32;
+        let function = raw::v9::Function {
+            name_offset: name_idx,
+            _comp_dir_offset: u32::MAX,
+            entry_pc: symbol.address as u32,
+            lang: u32::MAX,
+        };
+        let function_idx = self.functions.insert_full(function).0 as u32;
 
-            raw::v9::SourceLocation {
-                file_idx: u32::MAX,
-                line: 0,
-                function_idx,
-                inlined_into_idx: u32::MAX,
+        if !line_records.is_empty() {
+            // The recovered rows may only describe subranges of the symbol span. Preserve those
+            // holes as explicit unknown mappings so later lookups do not accidentally inherit the
+            // previous source location across a gap.
+            let mut current_address = symbol.address;
+            let symbol_end =
+                (symbol.size > 0).then_some(symbol.address.saturating_add(symbol.size));
+
+            for line in line_records {
+                if line.address > current_address {
+                    insert_source_location(&mut self.ranges, current_address as u32, || {
+                        raw::v9::SourceLocation {
+                            file_idx: u32::MAX,
+                            line: 0,
+                            function_idx,
+                            inlined_into_idx: u32::MAX,
+                        }
+                    });
+                }
+
+                let source_location =
+                    self.source_location_from_line(line, function_idx, u32::MAX, None);
+                self.ranges.insert(line.address as u32, source_location);
+
+                current_address = line
+                    .size
+                    .map_or(line.address, |size| line.address.saturating_add(size));
             }
-        });
+
+            if let Some(symbol_end) = symbol_end {
+                if current_address >= symbol_end {
+                    // The recovered line rows already cover the remainder of the symbol span.
+                } else {
+                    insert_source_location(&mut self.ranges, current_address as u32, || {
+                        raw::v9::SourceLocation {
+                            file_idx: u32::MAX,
+                            line: 0,
+                            function_idx,
+                            inlined_into_idx: u32::MAX,
+                        }
+                    });
+                }
+            }
+        } else {
+            // Even when recovery finds no rows, we still keep the symbol itself. That preserves the
+            // function name for shapes where we know code exists but source information genuinely
+            // does not.
+            //
+            // Only overwrite explicit end-of-range sentinels here. If a function walk already
+            // produced a concrete source location, the symbol fallback must not replace it.
+            insert_source_location(&mut self.ranges, symbol.address as u32, || {
+                raw::v9::SourceLocation {
+                    file_idx: u32::MAX,
+                    line: 0,
+                    function_idx,
+                    inlined_into_idx: u32::MAX,
+                }
+            });
+        }
 
         let last_addr = self.last_addr.get_or_insert(0);
         if symbol.address as u32 >= *last_addr {
@@ -470,6 +620,25 @@ impl<'a> SymCacheConverter<'a> {
                 vacant_entry.insert(NO_SOURCE_LOCATION);
             }
         }
+    }
+
+    fn source_location_covering(&self, address: u32) -> Option<&raw::v9::SourceLocation> {
+        self.ranges.range(..=address).next_back().map(|(_, sl)| sl)
+    }
+
+    fn should_probe_symbol_line_records(&self, symbol: &Symbol<'_>) -> bool {
+        // Skip symbol fallback once some earlier phase has already installed a concrete source
+        // location for this address. We still allow probes to replace explicit unknown mappings,
+        // because those are exactly the placeholders we create for uncovered optimized code.
+        let Ok(address) = u32::try_from(symbol.address) else {
+            return false;
+        };
+
+        self.source_location_covering(address)
+            .is_none_or(|source_location| {
+                *source_location == NO_SOURCE_LOCATION
+                    || (source_location.file_idx == u32::MAX && source_location.line == 0)
+            })
     }
 
     // Methods for serializing to a [`Write`] below:
@@ -551,6 +720,39 @@ impl<'a> SymCacheConverter<'a> {
 
         Ok(())
     }
+}
+
+fn merge_ranges(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut current = ranges.remove(0);
+
+    for range in ranges {
+        if range.start <= current.end {
+            current.end = current.end.max(range.end);
+        } else {
+            merged.push(current);
+            current = range;
+        }
+    }
+
+    merged.push(current);
+    merged
+}
+
+fn range_is_covered(ranges: &[Range<u64>], address: u64, size: u64) -> bool {
+    // The ranges are already sorted and merged, so full coverage can only come from the last
+    // range whose start is at or before the query start.
+    let query = address..address.saturating_add(size.max(1));
+    let index = ranges.partition_point(|range| range.start <= query.start);
+
+    index
+        .checked_sub(1)
+        .and_then(|idx| ranges.get(idx))
+        .is_some_and(|range| range.end >= query.end)
 }
 
 /// Inserts a source location into a map, but only if there either isn't already

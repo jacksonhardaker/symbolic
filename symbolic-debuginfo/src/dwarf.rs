@@ -15,6 +15,7 @@ use std::error::Error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Deref;
+use std::ops::Range as StdRange;
 use std::sync::Arc;
 
 use fallible_iterator::FallibleIterator;
@@ -242,11 +243,16 @@ struct DwarfSequence {
 #[derive(Debug)]
 struct DwarfLineProgram<'d> {
     header: LineNumberProgramHeader<'d>,
+    // Each sequence stores the decoded rows for that contiguous line-program region so repeated
+    // address queries do not need to rerun gimli's state machine over the raw DWARF program.
     sequences: Vec<DwarfSequence>,
 }
 
 impl<'d> DwarfLineProgram<'d> {
     fn prepare(program: IncompleteLineNumberProgram<'d>) -> Self {
+        // This eagerly decodes the unit's line program once per debug session. That is more work
+        // up front than a purely lazy row walk, but it amortizes well for symcache conversion,
+        // which may query many distinct address ranges against the same session.
         let mut sequences = Vec::new();
         let mut sequence_rows = Vec::<DwarfRow>::new();
         let mut prev_address = 0;
@@ -339,6 +345,9 @@ impl<'d> DwarfLineProgram<'d> {
     }
 
     pub fn get_rows(&self, range: &Range) -> &[DwarfRow] {
+        // The prepared rows and per-sequence bounds are already cached on the session. What still
+        // happens per query is selecting the first overlapping sequence and binary-searching the
+        // rows inside that sequence.
         for seq in &self.sequences {
             if seq.end <= range.begin || seq.start > range.end {
                 continue;
@@ -1209,6 +1218,7 @@ struct DwarfInfo<'data> {
     symbol_map: SymbolMap<'data>,
     address_offset: i64,
     kind: ObjectKind,
+    line_record_ranges: OnceCell<Vec<StdRange<u64>>>,
 }
 
 impl<'d> Deref for DwarfInfo<'d> {
@@ -1262,7 +1272,38 @@ impl<'d> DwarfInfo<'d> {
             symbol_map,
             address_offset,
             kind,
+            line_record_ranges: OnceCell::new(),
         })
+    }
+
+    fn line_record_ranges(&self) -> Result<&[StdRange<u64>], DwarfError> {
+        self.line_record_ranges
+            .get_or_try_init(|| {
+                let mut ranges = Vec::new();
+
+                for index in 0..self.headers.len() {
+                    let Some(unit) = self.get_unit(index)? else {
+                        continue;
+                    };
+                    let Some(unit) = DwarfUnit::from_unit(unit, self, None)? else {
+                        continue;
+                    };
+                    let Some(line_program) = unit.line_program.as_ref() else {
+                        continue;
+                    };
+
+                    // We only cache sequence envelopes here. They are much cheaper to build than
+                    // full line rows and let address probes reject the common negative case before
+                    // we walk every unit's rows.
+                    for sequence in &line_program.sequences {
+                        ranges.push(sequence.start..sequence.end);
+                    }
+                }
+
+                ranges.sort_unstable_by_key(|range| range.start);
+                Ok(merge_ranges(ranges))
+            })
+            .map(Vec::as_slice)
     }
 
     /// Loads a compilation unit.
@@ -1439,6 +1480,69 @@ impl<'data> DwarfDebugSession<'data> {
     ) -> Result<Option<SourceFileDescriptor<'_>>, DwarfError> {
         Ok(None)
     }
+
+    /// Returns line records whose ranges overlap the requested address span.
+    pub fn line_records(&self, address: u64, size: u64) -> Result<Vec<LineInfo<'_>>, DwarfError> {
+        let address_offset = self.cell.get().address_offset;
+        let query = Range {
+            begin: offset(address, -address_offset),
+            end: offset(address.saturating_add(size.max(1)), -address_offset),
+        };
+
+        // Negative lookups dominate the recovery path in symcache conversion. Before we walk any
+        // units or materialize rows, ask the cached line-program sequence index whether any unit
+        // can possibly overlap this address span.
+        if !range_overlaps_any(
+            self.cell.get().line_record_ranges()?,
+            &(query.begin..query.end),
+        ) {
+            return Ok(Vec::new());
+        }
+
+        let mut line_records = Vec::new();
+
+        for unit in self.cell.get().units(self.bcsymbolmap.as_deref()) {
+            let unit = unit?;
+            let Some(line_program) = unit.line_program.as_ref() else {
+                continue;
+            };
+
+            // The cached sequence ranges only tell us that some rows in this unit may overlap the
+            // query. `get_rows` performs the precise row-level clipping for the surviving units.
+            // We intentionally do not cache full query results here: symcache backfill probes many
+            // distinct address ranges, so result-level memoization is unlikely to have useful hit
+            // rates. The remaining per-call work is unit iteration, sequence selection, row
+            // clipping, file resolution for returned rows, and final sort/dedup of the aggregate.
+            for row in line_program.get_rows(&query) {
+                let row_end = row
+                    .size
+                    .map_or(query.end, |size| row.address.saturating_add(size))
+                    .min(query.end);
+                let row_start = row.address.max(query.begin);
+
+                if row_end <= row_start {
+                    continue;
+                }
+
+                line_records.push(LineInfo {
+                    address: offset(row_start, address_offset),
+                    size: Some(row_end - row_start),
+                    file: unit.resolve_file(row.file_index).unwrap_or_default(),
+                    line: row.line.unwrap_or(0),
+                });
+            }
+        }
+
+        line_records.sort_by_key(|line| line.address);
+        line_records.dedup_by(|left, right| {
+            left.address == right.address
+                && left.size == right.size
+                && left.line == right.line
+                && left.file == right.file
+        });
+
+        Ok(line_records)
+    }
 }
 
 impl<'session> DebugSession<'session> for DwarfDebugSession<'_> {
@@ -1457,6 +1561,46 @@ impl<'session> DebugSession<'session> for DwarfDebugSession<'_> {
     fn source_by_path(&self, path: &str) -> Result<Option<SourceFileDescriptor<'_>>, Self::Error> {
         self.source_by_path(path)
     }
+
+    fn line_records(
+        &'session self,
+        address: u64,
+        size: u64,
+    ) -> Result<Vec<LineInfo<'session>>, Self::Error> {
+        self.line_records(address, size)
+    }
+}
+
+fn merge_ranges(mut ranges: Vec<StdRange<u64>>) -> Vec<StdRange<u64>> {
+    if ranges.is_empty() {
+        return ranges;
+    }
+
+    let mut merged = Vec::with_capacity(ranges.len());
+    let mut current = ranges.remove(0);
+
+    for range in ranges {
+        if range.start <= current.end {
+            current.end = current.end.max(range.end);
+        } else {
+            merged.push(current);
+            current = range;
+        }
+    }
+
+    merged.push(current);
+    merged
+}
+
+fn range_overlaps_any(ranges: &[StdRange<u64>], query: &StdRange<u64>) -> bool {
+    // The ranges are sorted and merged, so any overlap must come from the last range whose start
+    // is still before `query.end`.
+    let index = ranges.partition_point(|range| range.start < query.end);
+
+    index
+        .checked_sub(1)
+        .and_then(|idx| ranges.get(idx))
+        .is_some_and(|range| range.end > query.start)
 }
 
 #[derive(Debug, Default)]
